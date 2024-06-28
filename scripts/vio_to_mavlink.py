@@ -20,7 +20,7 @@ import os
 os.environ["MAVLINK20"] = "1"
 
 # Import the libraries
-import pyrealsense2 as rs
+#import pyrealsense2 as rs
 import numpy as np
 import transformations as tf
 import math as m
@@ -28,6 +28,8 @@ import time
 import argparse
 import threading
 import signal
+import rospy
+from geometry_msgs.msg import PoseWithCovarianceStamped
 
 from time import sleep
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -45,8 +47,8 @@ def progress(string):
 #######################################
 
 # Default configurations for connection to the FCU
-connection_string_default = '/dev/ttyUSB0'
-connection_baudrate_default = 921600
+connection_string_default = 'udpin:localhost:14552'
+connection_baudrate_default = 57600
 connection_timeout_sec_default = 5
 
 # Transformation to convert different camera orientations to NED convention. Replace camera_orientation_default for your configuration.
@@ -59,25 +61,25 @@ camera_orientation_default = 0
 
 # https://mavlink.io/en/messages/common.html#VISION_POSITION_ESTIMATE
 enable_msg_vision_position_estimate = True
-vision_position_estimate_msg_hz_default = 30.0
+vision_position_estimate_msg_hz_default = 10.0
 
 # https://mavlink.io/en/messages/ardupilotmega.html#VISION_POSITION_DELTA
 enable_msg_vision_position_delta = False
 vision_position_delta_msg_hz_default = 30.0
 
 # https://mavlink.io/en/messages/common.html#VISION_SPEED_ESTIMATE
-enable_msg_vision_speed_estimate = True
+enable_msg_vision_speed_estimate = False
 vision_speed_estimate_msg_hz_default = 30.0
 
 # https://mavlink.io/en/messages/common.html#STATUSTEXT
-enable_update_tracking_confidence_to_gcs = True
+enable_update_tracking_confidence_to_gcs = False
 update_tracking_confidence_to_gcs_hz_default = 1.0
 
 # Monitor user's online input via keyboard, can only be used when runs from terminal
 enable_user_keyboard_input = False
 
 # Default global position for EKF home/ origin
-enable_auto_set_ekf_home = False
+enable_auto_set_ekf_home = True
 home_lat = 151269321    # Somewhere random
 home_lon = 16624301     # Somewhere random
 home_alt = 163000       # Somewhere random
@@ -154,6 +156,8 @@ parser.add_argument('--camera_orientation', type=int,
                     help="Configuration for camera orientation. Currently supported: forward, usb port to the right - 0; downward, usb port to the right - 1, 2: forward tilted down 45deg")
 parser.add_argument('--debug_enable',type=int,
                     help="Enable debug messages on terminal")
+parser.add_argument('--odometry_topic', type=str,
+                    help="Topic name for odometry data with PoseStampedwithCovariance topic")
 
 args = parser.parse_args()
 
@@ -165,6 +169,7 @@ vision_speed_estimate_msg_hz = args.vision_speed_estimate_msg_hz
 scale_calib_enable = args.scale_calib_enable
 camera_orientation = args.camera_orientation
 debug_enable = args.debug_enable
+odometry_topic = args.odometry_topic
 
 # Using default values if no specified inputs
 if not connection_string:
@@ -222,7 +227,11 @@ else:
     progress("INFO: Using camera orientation %s" % camera_orientation)
 
 if camera_orientation == 0:     # Forward, USB port to the right
-    H_aeroRef_T265Ref   = np.array([[0,0,-1,0],[1,0,0,0],[0,-1,0,0],[0,0,0,1]])
+    H_aeroRef_T265Ref   = np.array([[-1,0,0,0],
+                                    [0,-1,0,0],
+                                    [0,0,-1,0],
+                                    [0,0,0,1]])
+    
     H_T265body_aeroBody = np.linalg.inv(H_aeroRef_T265Ref)
 elif camera_orientation == 1:   # Downfacing, USB port to the right
     H_aeroRef_T265Ref   = np.array([[0,0,-1,0],[1,0,0,0],[0,-1,0,0],[0,0,0,1]])
@@ -266,6 +275,30 @@ def mavlink_loop(conn, callbacks):
             continue
         callbacks[m.get_type()](m)
 
+
+def convert_full_matrix_to_upper_triangle(full_matrix):
+    # Ensure full_matrix is a 6x6 matrix
+    if len(full_matrix) != 36:
+        raise ValueError("Input matrix must have 36 elements")
+    
+    # Reshape the flattened matrix into a 6x6 matrix
+    matrix_6x6 = np.array(full_matrix).reshape(6, 6)
+    
+    # Define the indices for the upper triangle (row-major order)
+    upper_indices = [
+        (0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (0, 5),
+        (1, 1), (1, 2), (1, 3), (1, 4), (1, 5),
+        (2, 2), (2, 3), (2, 4), (2, 5),
+        (3, 3), (3, 4), (3, 5),
+        (4, 4), (4, 5),
+        (5, 5)
+    ]
+    
+    # Extract the upper triangle elements
+    upper_triangle = [matrix_6x6[i, j] for i, j in upper_indices]
+    
+    return upper_triangle
+
 # https://mavlink.io/en/messages/common.html#VISION_POSITION_ESTIMATE
 def send_vision_position_estimate_message():
     global current_time_us, H_aeroRef_aeroBody, reset_counter
@@ -276,14 +309,17 @@ def send_vision_position_estimate_message():
 
             # Setup covariance data, which is the upper right triangle of the covariance matrix, see here: https://files.gitter.im/ArduPilot/VisionProjects/1DpU/image.png
             # Attemp #01: following this formula https://github.com/IntelRealSense/realsense-ros/blob/development/realsense2_camera/src/base_realsense_node.cpp#L1406-L1411
-            cov_pose    = linear_accel_cov * pow(10, 3 - int(data.tracker_confidence))
-            cov_twist   = angular_vel_cov  * pow(10, 1 - int(data.tracker_confidence))
-            covariance  = np.array([cov_pose, 0, 0, 0, 0, 0,
-                                       cov_pose, 0, 0, 0, 0,
-                                          cov_pose, 0, 0, 0,
-                                            cov_twist, 0, 0,
-                                               cov_twist, 0,
-                                                  cov_twist])
+            # cov_pose    = linear_accel_cov * pow(10, 3 - int(data.tracker_confidence))
+            # cov_twist   = angular_vel_cov  * pow(10, 1 - int(data.tracker_confidence))
+            # covariance  = np.array([cov_pose, 0, 0, 0, 0, 0,
+            #                            cov_pose, 0, 0, 0, 0,
+            #                               cov_pose, 0, 0, 0,
+            #                                 cov_twist, 0, 0,
+            #                                    cov_twist, 0,
+            #                                       cov_twist])
+
+            upper_triangle_covariance = convert_full_matrix_to_upper_triangle(data.covariance)
+
 
             # Send the message
             conn.mav.vision_position_estimate_send(
@@ -294,7 +330,7 @@ def send_vision_position_estimate_message():
                 rpy_rad[0],	                # Roll angle
                 rpy_rad[1],	                # Pitch angle
                 rpy_rad[2],	                # Yaw angle
-                covariance,                 # Row-major representation of pose 6x6 cross-covariance matrix
+                upper_triangle_covariance,                 # Row-major representation of pose 6x6 cross-covariance matrix
                 reset_counter               # Estimate reset counter. Increment every time pose estimate jumps.
             )
 
@@ -330,11 +366,11 @@ def send_vision_speed_estimate_message():
     with lock:
         if V_aeroRef_aeroBody is not None:
 
-            # Attemp #01: following this formula https://github.com/IntelRealSense/realsense-ros/blob/development/realsense2_camera/src/base_realsense_node.cpp#L1406-L1411
-            cov_pose    = linear_accel_cov * pow(10, 3 - int(data.tracker_confidence))
-            covariance  = np.array([cov_pose,   0,          0,
-                                    0,          cov_pose,   0,
-                                    0,          0,          cov_pose])
+            # # Attemp #01: following this formula https://github.com/IntelRealSense/realsense-ros/blob/development/realsense2_camera/src/base_realsense_node.cpp#L1406-L1411
+            # cov_pose    = linear_accel_cov * pow(10, 3 - int(data.tracker_confidence))
+            # covariance  = np.array([cov_pose,   0,          0,
+            #                         0,          cov_pose,   0,
+            #                         0,          0,          cov_pose])
             
             # Send the message
             conn.mav.vision_speed_estimate_send(
@@ -342,7 +378,7 @@ def send_vision_speed_estimate_message():
                 V_aeroRef_aeroBody[0][3],   # Global X speed
                 V_aeroRef_aeroBody[1][3],   # Global Y speed
                 V_aeroRef_aeroBody[2][3],   # Global Z speed
-                covariance,                 # covariance
+                0,                 # covariance
                 reset_counter               # Estimate reset counter. Increment every time pose estimate jumps.
             )
 
@@ -356,7 +392,7 @@ def update_tracking_confidence_to_gcs():
 # https://mavlink.io/en/messages/common.html#STATUSTEXT
 def send_msg_to_gcs(text_to_be_sent):
     # MAV_SEVERITY: 0=EMERGENCY 1=ALERT 2=CRITICAL 3=ERROR, 4=WARNING, 5=NOTICE, 6=INFO, 7=DEBUG, 8=ENUM_END
-    text_msg = 'T265: ' + text_to_be_sent
+    text_msg = 'VISO: ' + text_to_be_sent
     conn.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, text_msg.encode())
     progress("INFO: %s" % text_to_be_sent)
 
@@ -417,44 +453,58 @@ def att_msg_callback(value):
 # Functions - T265
 #######################################
 
-def increment_reset_counter():
-    global reset_counter
-    if reset_counter >= 255:
-        reset_counter = 1
-    reset_counter += 1
+# def increment_reset_counter():
+#     global reset_counter
+#     if reset_counter >= 255:
+#         reset_counter = 1
+#     reset_counter += 1
 
-# List of notification events: https://github.com/IntelRealSense/librealsense/blob/development/include/librealsense2/h/rs_types.h
-# List of notification API: https://github.com/IntelRealSense/librealsense/blob/development/common/notifications.cpp
-def realsense_notification_callback(notif):
-    progress("INFO: T265 event: " + notif)
-    if notif.get_category() is rs.notification_category.pose_relocalization:
-        increment_reset_counter()
-        send_msg_to_gcs('Relocalization detected')
+# # List of notification events: https://github.com/IntelRealSense/librealsense/blob/development/include/librealsense2/h/rs_types.h
+# # List of notification API: https://github.com/IntelRealSense/librealsense/blob/development/common/notifications.cpp
+# def realsense_notification_callback(notif):
+#     progress("INFO: T265 event: " + notif)
+#     if notif.get_category() is rs.notification_category.pose_relocalization:
+#         increment_reset_counter()
+#         send_msg_to_gcs('Relocalization detected')
 
-def realsense_connect():
-    global pipe, pose_sensor
+# def realsense_connect():
+#     global pipe, pose_sensor
     
-    # Declare RealSense pipeline, encapsulating the actual device and sensors
-    pipe = rs.pipeline()
+#     # Declare RealSense pipeline, encapsulating the actual device and sensors
+#     pipe = rs.pipeline()
 
-    # Build config object before requesting data
-    cfg = rs.config()
+#     # Build config object before requesting data
+#     cfg = rs.config()
 
-    # Enable the stream we are interested in
-    cfg.enable_stream(rs.stream.pose) # Positional data
+#     # Enable the stream we are interested in
+#     cfg.enable_stream(rs.stream.pose) # Positional data
 
-    # Configure callback for relocalization event
-    device = cfg.resolve(pipe).get_device()
-    pose_sensor = device.first_pose_sensor()
-    pose_sensor.set_notifications_callback(realsense_notification_callback)
+#     # Configure callback for relocalization event
+#     device = cfg.resolve(pipe).get_device()
+#     pose_sensor = device.first_pose_sensor()
+#     pose_sensor.set_notifications_callback(realsense_notification_callback)
 
-    # Start streaming with requested config
-    pipe.start(cfg)
+#     # Start streaming with requested config
+#     pipe.start(cfg)
 
+#######################################
+# Functions - ROS
+#######################################
+
+def ros_initialize(odom_topic):
+    global data
+    odom_subscriber = rospy.Subscriber(odom_topic, PoseWithCovarianceStamped, pose_callback, queue_size=10)
+    
+    rospy.init_node("openvins_to_mavlink")
 #######################################
 # Functions - Miscellaneous
 #######################################
 
+def pose_callback(pose_msg):
+    global data
+    data = pose_msg
+    #rospy.loginfo("Received pose message")
+    
 # Monitor user input from the terminal and perform action accordingly
 def user_input_monitor():
     global scale_factor
@@ -487,11 +537,11 @@ def user_input_monitor():
 # Main code starts here
 #######################################
 
-try:
-    progress("INFO: pyrealsense2 version: %s" % str(rs.__version__))
-except Exception:
-    # fail silently
-    pass
+# try:
+#     progress("INFO: pyrealsense2 version: %s" % str(rs.__version__))
+# except Exception:
+#     # fail silently
+#     pass
 
 progress("INFO: Starting Vehicle communications")
 conn = mavutil.mavlink_connection(
@@ -518,8 +568,8 @@ mavlink_thread.start()
 # send_msg_to_gcs('Setting timer...')
 signal.setitimer(signal.ITIMER_REAL, 5)  # seconds...
 
-send_msg_to_gcs('Connecting to camera...')
-realsense_connect()
+send_msg_to_gcs('Connecting to odometry topic...')
+ros_initialize(odometry_topic)
 send_msg_to_gcs('Camera connected.')
 
 signal.setitimer(signal.ITIMER_REAL, 0)  # cancel alarm
@@ -577,56 +627,56 @@ send_msg_to_gcs('Sending vision messages to FCU')
 try:
     while not main_loop_should_quit:
         # Wait for the next set of frames from the camera
-        frames = pipe.wait_for_frames()
+        #frames = pipe.wait_for_frames()
 
         # Fetch pose frame
-        pose = frames.get_pose_frame()
+        #pose = frames.get_pose_frame()
 
         # Process data
-        if pose:
+        if data:
             with lock:
                 # Store the timestamp for MAVLink messages
                 current_time_us = int(round(time.time() * 1000000))
 
                 # Pose data consists of translation and rotation
-                data = pose.get_pose_data()
+                #data = pose.get_pose_data()
                 
                 # Confidence level value from T265: 0-3, remapped to 0 - 100: 0% - Failed / 33.3% - Low / 66.6% - Medium / 100% - High  
-                current_confidence_level = float(data.tracker_confidence * 100 / 3)  
 
                 # In transformations, Quaternions w+ix+jy+kz are represented as [w, x, y, z]!
-                H_T265Ref_T265body = tf.quaternion_matrix([data.rotation.w, data.rotation.x, data.rotation.y, data.rotation.z]) 
-                H_T265Ref_T265body[0][3] = data.translation.x * scale_factor
-                H_T265Ref_T265body[1][3] = data.translation.y * scale_factor
-                H_T265Ref_T265body[2][3] = data.translation.z * scale_factor
+                H_T265Ref_T265body = tf.quaternion_matrix([data.pose.pose.orientation.w, data.pose.pose.orientation.x, data.pose.pose.orientation.y, data.pose.pose.orientation.z]) 
+                H_T265Ref_T265body[0][3] = data.pose.pose.position.x * scale_factor
+                H_T265Ref_T265body[1][3] = data.pose.pose.position.y * scale_factor
+                H_T265Ref_T265body[2][3] = data.pose.pose.position.z * scale_factor
 
                 # Transform to aeronautic coordinates (body AND reference frame!)
                 H_aeroRef_aeroBody = H_aeroRef_T265Ref.dot( H_T265Ref_T265body.dot( H_T265body_aeroBody))
 
                 # Calculate GLOBAL XYZ speed (speed from T265 is already GLOBAL)
-                V_aeroRef_aeroBody = tf.quaternion_matrix([1,0,0,0])
-                V_aeroRef_aeroBody[0][3] = data.velocity.x
-                V_aeroRef_aeroBody[1][3] = data.velocity.y
-                V_aeroRef_aeroBody[2][3] = data.velocity.z
-                V_aeroRef_aeroBody = H_aeroRef_T265Ref.dot(V_aeroRef_aeroBody)
+                
+                #V_aeroRef_aeroBody = tf.quaternion_matrix([1,0,0,0])
+                #V_aeroRef_aeroBody[0][3] = data.velocity.x
+                #V_aeroRef_aeroBody[1][3] = data.velocity.y
+                #V_aeroRef_aeroBody[2][3] = data.velocity.z
+                #V_aeroRef_aeroBody = H_aeroRef_T265Ref.dot(V_aeroRef_aeroBody)
 
                 # Check for pose jump and increment reset_counter
                 if prev_data != None:
-                    delta_translation = [data.translation.x - prev_data.translation.x, data.translation.y - prev_data.translation.y, data.translation.z - prev_data.translation.z]
-                    delta_velocity = [data.velocity.x - prev_data.velocity.x, data.velocity.y - prev_data.velocity.y, data.velocity.z - prev_data.velocity.z]
+                    delta_translation = [data.pose.pose.position.x - prev_data.pose.pose.position.x, data.pose.pose.position.y - prev_data.pose.pose.position.y, data.pose.pose.position.z - prev_data.pose.pose.position.z]
+                    #delta_velocity = [data.velocity.x - prev_data.velocity.x, data.velocity.y - prev_data.velocity.y, data.velocity.z - prev_data.velocity.z]
                     position_displacement = np.linalg.norm(delta_translation)
-                    speed_delta = np.linalg.norm(delta_velocity)
+                    #speed_delta = np.linalg.norm(delta_velocity)
 
                     # Pose jump is indicated when position changes abruptly. The behavior is not well documented yet (as of librealsense 2.34.0)
                     jump_threshold = 0.1 # in meters, from trials and errors, should be relative to how frequent is the position data obtained (200Hz for the T265)
                     jump_speed_threshold = 20.0 # in m/s from trials and errors, should be relative to how frequent is the velocity data obtained (200Hz for the T265)
-                    if (position_displacement > jump_threshold) or (speed_delta > jump_speed_threshold):
+                    if (position_displacement > jump_threshold): #or (speed_delta > jump_speed_threshold):
                         send_msg_to_gcs('VISO jump detected')
                         if position_displacement > jump_threshold:
                             progress("Position jumped by: %s" % position_displacement)
-                        elif speed_delta > jump_speed_threshold:
-                            progress("Speed jumped by: %s" % speed_delta)
-                        increment_reset_counter()
+                        # elif speed_delta > jump_speed_threshold:
+                        #     progress("Speed jumped by: %s" % speed_delta)
+                        # increment_reset_counter()
                     
                 prev_data = data
 
@@ -648,7 +698,7 @@ try:
                     os.system('clear') # This helps in displaying the messages to be more readable
                     progress("DEBUG: Raw RPY[deg]: {}".format( np.array( tf.euler_from_matrix( H_T265Ref_T265body, 'sxyz')) * 180 / m.pi))
                     progress("DEBUG: NED RPY[deg]: {}".format( np.array( tf.euler_from_matrix( H_aeroRef_aeroBody, 'sxyz')) * 180 / m.pi))
-                    progress("DEBUG: Raw pos xyz : {}".format( np.array( [data.translation.x, data.translation.y, data.translation.z])))
+                    progress("DEBUG: Raw pos xyz : {}".format( np.array( [data.pose.pose.position.x, data.pose.pose.position.y, data.pose.pose.position.z])))
                     progress("DEBUG: NED pos xyz : {}".format( np.array( tf.translation_from_matrix( H_aeroRef_aeroBody))))
 
 except Exception as e:
@@ -662,7 +712,6 @@ finally:
     progress('Closing the script...')
     # start a timer in case stopping everything nicely doesn't work.
     signal.setitimer(signal.ITIMER_REAL, 5)  # seconds...
-    pipe.stop()
     mavlink_thread_should_exit = True
     mavlink_thread.join()
     conn.close()
